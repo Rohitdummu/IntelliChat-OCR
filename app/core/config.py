@@ -5,35 +5,41 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATABASE_PATH = PROJECT_ROOT / "app.db"
 
 
 class Settings(BaseSettings):
 
+    # Application
+    APP_ENV: str = "development"
+
+    # Database
     DATABASE_URL: str
 
+    # Azure Blob Storage
     AZURE_STORAGE_CONNECTION_STRING: str
-    AZURE_STORAGE_ACCOUNT_NAME: str
-    AZURE_STORAGE_ACCOUNT_KEY: str
-    AZURE_STORAGE_CONTAINER: str = "documents"
+    AZURE_STORAGE_ACCOUNT_NAME: str = "genaidemorohit"
+    AZURE_STORAGE_ACCOUNT_KEY: str = ""
+    AZURE_STORAGE_CONTAINER: str = "ocr-pdfs"
 
+    # Azure Content Understanding
     CONTENTUNDERSTANDING_ENDPOINT: str
     CONTENTUNDERSTANDING_KEY: str
-    CONTENTUNDERSTANDING_ANALYZER_ID: str
     CONTENTUNDERSTANDING_API_VERSION: str = "2025-11-01"
-    CONTENTUNDERSTANDING_CLASSIFIER_ID: str
-    CONTENTUNDERSTANDING_CLASSIFIER_ID: str
 
-    CONTENTUNDERSTANDING_CLAIM_FORM_ID: str
-    CONTENTUNDERSTANDING_DISCHARGE_SUMMARY_ID: str
-    CONTENTUNDERSTANDING_HOSPITAL_BILL_ID: str
-    CONTENTUNDERSTANDING_LAB_REPORT_ID: str
+    CONTENTUNDERSTANDING_ANALYZER_ID: str = "Banking_Analyzer"
+    CONTENTUNDERSTANDING_CLASSIFIER_ID: str = "Healthcare_Document_Analyzer"
 
+    CONTENTUNDERSTANDING_CLAIM_FORM_ID: str = "Claim_Form_Extractor"
+    CONTENTUNDERSTANDING_DISCHARGE_SUMMARY_ID: str = "Discharge_Summary_Extractor"
+    CONTENTUNDERSTANDING_HOSPITAL_BILL_ID: str = "Hospital_Bill_Extractor"
+    CONTENTUNDERSTANDING_LAB_REPORT_ID: str = "Lab_Report_Extractor"
+
+    # Azure OpenAI
     AZURE_OPENAI_ENDPOINT: str
     AZURE_OPENAI_API_KEY: str
-    AZURE_OPENAI_API_VERSION: str
-    AZURE_OPENAI_CHAT_DEPLOYMENT: str
-    
+    AZURE_OPENAI_API_VERSION: str = "2025-11-13"
+    AZURE_OPENAI_CHAT_DEPLOYMENT: str = "gpt-5.1"
+
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def normalize_database_url(cls, value):
@@ -53,7 +59,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
-        extra="ignore"
+        extra="ignore",
+        case_sensitive=False
     )
 
 
