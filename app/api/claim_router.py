@@ -467,7 +467,7 @@ def get_claim_review_details(
     claim_id: str,
     db: Session = Depends(get_db)
 ):
-    # Step 1: Fetch claim
+    # 1. Fetch claim
     claim = (
         db.query(Claim)
         .filter(Claim.id == claim_id)
@@ -480,29 +480,68 @@ def get_claim_review_details(
             detail="Claim not found"
         )
 
-    # Step 2: Fetch associated documents
+    # 2. Fetch all document versions
     documents = (
         db.query(Document)
         .filter(Document.claim_id == claim_id)
-        .order_by(Document.created_at.asc())
+        .order_by(
+            Document.document_group_id,
+            Document.version.asc()
+        )
         .all()
     )
 
-    # Step 3: Prepare document details
+    # 3. Identify latest version of each document group
+    latest_versions = {}
+
+    for document in documents:
+        group_id = document.document_group_id or document.id
+
+        current = latest_versions.get(group_id)
+
+        if (
+            current is None
+            or document.version > current.version
+        ):
+            latest_versions[group_id] = document
+
+    # 4. Prepare document details
     document_details = []
 
     for document in documents:
+
+        group_id = document.document_group_id or document.id
+
+        latest_document = latest_versions[group_id]
+
         document_details.append({
             "document_id": document.id,
             "filename": document.filename,
             "document_type": document.document_type,
+
+            # Version information
+            "document_group_id": group_id,
+            "version": document.version,
+            "previous_document_id": document.previous_document_id,
+            "is_latest_version": document.id == latest_document.id,
+
+            # Processing information
             "status": document.status,
+            "review_status": document.review_status,
+
+            # Extraction information
             "structured_result": document.structured_result,
             "error_message": document.error_message,
+
+            # Resubmission information
+            "resubmission_reason": document.resubmission_reason,
+
             "created_at": document.created_at
         })
 
-    # Step 4: Return review details
+    # 5. Calculate summary
+    latest_documents = list(latest_versions.values())
+
     return {
         "claim_details": {
             "claim_id": claim.id,
@@ -516,14 +555,15 @@ def get_claim_review_details(
         },
 
         "document_summary": {
-            "total_documents": len(documents),
-            "processed_documents": sum(
+            "total_document_versions": len(documents),
+            "total_logical_documents": len(latest_documents),
+            "processed_latest_documents": sum(
                 doc.status == "completed"
-                for doc in documents
+                for doc in latest_documents
             ),
-            "failed_documents": sum(
+            "failed_latest_documents": sum(
                 doc.status == "failed"
-                for doc in documents
+                for doc in latest_documents
             )
         },
 
@@ -533,70 +573,142 @@ def get_claim_review_details(
     }
 
 
-@claim_router.post("/{claim_id}/review")
-def submit_claim_review(
-    claim_id: str,
-    request: ClaimReviewRequest,
-    db: Session = Depends(get_db)
-):
 
-    # Step 1: Fetch claim
-    claim = (
-        db.query(Claim)
-        .filter(Claim.id == claim_id)
-        .first()
-    )
+# @claim_router.get("/{claim_id}/review-details")
+# def get_claim_review_details(
+#     claim_id: str,
+#     db: Session = Depends(get_db)
+# ):
+#     # Step 1: Fetch claim
+#     claim = (
+#         db.query(Claim)
+#         .filter(Claim.id == claim_id)
+#         .first()
+#     )
 
-    if not claim:
-        raise HTTPException(
-            status_code=404,
-            detail="Claim not found"
-        )
+#     if not claim:
+#         raise HTTPException(
+#             status_code=404,
+#             detail="Claim not found"
+#         )
 
-    # Step 2: Ensure validation has been performed
-    if not claim.validation_result:
-        raise HTTPException(
-            status_code=400,
-            detail="Claim has not been validated yet"
-        )
+#     # Step 2: Fetch associated documents
+#     documents = (
+#         db.query(Document)
+#         .filter(Document.claim_id == claim_id)
+#         .order_by(Document.created_at.asc())
+#         .all()
+#     )
 
-    # Step 3: Create review record
-    review = ClaimReview(
-        claim_id=claim.id,
-        action=request.action,
-        reviewer=request.reviewer,
-        comments=request.comments
-    )
+#     # Step 3: Prepare document details
+#     document_details = []
 
-    # Step 4: Update claim status
-    claim.status = request.action
+#     for document in documents:
+#         document_details.append({
+#             "document_id": document.id,
+#             "filename": document.filename,
+#             "document_type": document.document_type,
+#             "status": document.status,
+#             "structured_result": document.structured_result,
+#             "error_message": document.error_message,
+#             "created_at": document.created_at
+#         })
 
-    # Step 5: Save to database
-    try:
-        db.add(review)
-        db.commit()
+#     # Step 4: Return review details
+#     return {
+#         "claim_details": {
+#             "claim_id": claim.id,
+#             "claim_number": claim.claim_number,
+#             "insured_person_name": claim.insured_person_name,
+#             "patient_name": claim.patient_name,
+#             "policy_number": claim.policy_number,
+#             "hospital_name": claim.hospital_name,
+#             "status": claim.status,
+#             "created_at": claim.created_at
+#         },
 
-        db.refresh(claim)
-        db.refresh(review)
+#         "document_summary": {
+#             "total_documents": len(documents),
+#             "processed_documents": sum(
+#                 doc.status == "completed"
+#                 for doc in documents
+#             ),
+#             "failed_documents": sum(
+#                 doc.status == "failed"
+#                 for doc in documents
+#             )
+#         },
 
-    except Exception:
-        db.rollback()
-        raise
+#         "documents": document_details,
 
-    # Step 6: Return response
-    return {
-        "message": "Claim review submitted successfully",
-        "claim_id": claim.id,
-        "claim_number": claim.claim_number,
-        "claim_status": claim.status,
-        "review": {
-            "review_id": review.id,
-            "action": review.action,
-            "reviewer": review.reviewer,
-            "comments": review.comments,
-            "created_at": review.created_at
-        }
-    }
+#         "validation_result": claim.validation_result
+#     }
+
+
+# @claim_router.post("/{claim_id}/review")
+# def submit_claim_review(
+#     claim_id: str,
+#     request: ClaimReviewRequest,
+#     db: Session = Depends(get_db)
+# ):
+
+#     # Step 1: Fetch claim
+#     claim = (
+#         db.query(Claim)
+#         .filter(Claim.id == claim_id)
+#         .first()
+#     )
+
+#     if not claim:
+#         raise HTTPException(
+#             status_code=404,
+#             detail="Claim not found"
+#         )
+
+#     # Step 2: Ensure validation has been performed
+#     if not claim.validation_result:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Claim has not been validated yet"
+#         )
+
+#     # Step 3: Create review record
+#     review = ClaimReview(
+#         claim_id=claim.id,
+#         action=request.action,
+#         reviewer=request.reviewer,
+#         comments=request.comments
+#     )
+
+#     # Step 4: Update claim status
+#     claim.status = request.action
+
+#     # Step 5: Save to database
+#     try:
+#         db.add(review)
+#         db.commit()
+
+#         db.refresh(claim)
+#         db.refresh(review)
+
+#     except Exception:
+#         db.rollback()
+#         raise
+
+#     # Step 6: Return response
+#     return {
+#         "message": "Claim review submitted successfully",
+#         "claim_id": claim.id,
+#         "claim_number": claim.claim_number,
+#         "claim_status": claim.status,
+#         "review": {
+#             "review_id": review.id,
+#             "action": review.action,
+#             "reviewer": review.reviewer,
+#             "comments": review.comments,
+#             "created_at": review.created_at
+#         }
+#     }
 
 
 @claim_router.get("/{claim_id}/reviews")

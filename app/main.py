@@ -16,6 +16,7 @@ from app.core.logging import setup_logging
 from app.services.azure_openai import AzureOpenAIService
 from app.core.config import settings
 from sqlalchemy.engine import make_url
+from app.api.document_review import review_router
 
 setup_logging()
 
@@ -99,7 +100,7 @@ app = FastAPI(
 
 app.include_router(document_router)
 app.include_router(claim_router)
-
+app.include_router(review_router)
 
 @app.get("/")
 def home():

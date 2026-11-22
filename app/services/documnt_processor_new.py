@@ -133,6 +133,10 @@ async def process_document_task_new(document_id: str):
         document.status = "completed"
         document.error_message = None
 
+        # Mark corrected document version ready for review
+        if document.previous_document_id:
+            document.review_status = "pending_review"
+
         db.commit()
 
         logger.info(
