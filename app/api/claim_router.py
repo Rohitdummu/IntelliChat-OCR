@@ -30,6 +30,7 @@ from app.workflows.claim_workflow import ClaimWorkflowOrchestrator
 from app.services.validation.claim_validation import ClaimValidationService
 from app.services.azure_openai import AzureOpenAIService
 from app.services.claim_aggregation import ClaimAggregationService
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -883,17 +884,20 @@ def get_claim_review_history(
 #         )
 
 
+
 @claim_router.post("/{claim_id}/run-workflow")
 def run_claim_workflow(
     claim_id: str,
     request: Request,
     db: Session = Depends(get_db)
 ):
-
     try:
-        claim = db.query(Claim).filter(
-            Claim.id == claim_id
-        ).first()
+        # 1. Fetch claim
+        claim = (
+            db.query(Claim)
+            .filter(Claim.id == claim_id)
+            .first()
+        )
 
         if not claim:
             raise HTTPException(
@@ -901,17 +905,60 @@ def run_claim_workflow(
                 detail="Claim not found"
             )
 
-        logger.info("Starting workflow for claim: %s", claim_id)
-
+        # 2. Aggregate latest document versions
         aggregated_claim = ClaimAggregationService(
             db
         ).aggregate_claim_documents(claim_id)
 
+        # 3. Ensure documents are ready
+        if aggregated_claim.get("status") != "ready_for_validation":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Claim documents are not ready for validation",
+                    "aggregation_status": aggregated_claim.get("status"),
+                    "missing_documents": aggregated_claim.get(
+                        "missing_documents", []
+                    ),
+                    "pending_documents": aggregated_claim.get(
+                        "pending_documents", []
+                    ),
+                    "duplicate_documents": aggregated_claim.get(
+                        "duplicate_documents", []
+                    )
+                }
+            )
+
+        # 4. Generate a new workflow cycle
+        previous_result = dict(claim.validation_result or {})
+
+        workflow_cycle = (
+            int(previous_result.get("workflow_cycle", 0)) + 1
+        )
+
+        workflow_run_id = str(uuid4())
+
+        thread_id = (
+            f"claim-{claim_id}-cycle-{workflow_cycle}-{workflow_run_id}"
+        )
+
+        trigger = (
+            "document_resubmission"
+            if previous_result.get("is_stale")
+            else "initial_submission"
+        )
+
+        logger.info(
+            "Starting workflow | claim=%s | cycle=%s | trigger=%s",
+            claim_id,
+            workflow_cycle,
+            trigger
+        )
+
+        # 5. Build orchestrator
         orchestrator = build_claim_workflow(request)
 
-        # Stable ID allows us to resume this claim's paused workflow
-        thread_id = f"claim-{claim_id}"
-
+        # 6. Prepare initial state
         initial_state = {
             "claim_id": claim_id,
             "aggregated_claim": aggregated_claim,
@@ -923,15 +970,18 @@ def run_claim_workflow(
             "review_decision": "",
             "reviewer": "",
             "review_comments": "",
+            "workflow_run_id": workflow_run_id,
+            "workflow_cycle": workflow_cycle,
+            "trigger": trigger,
             "error_message": ""
         }
 
+        # 7. Execute fresh LangGraph workflow
         result = orchestrator.execute(
             initial_state,
             thread_id
         )
 
-        # Check whether LangGraph paused for human review
         interrupts = result.get("__interrupt__", [])
 
         validation_result = result.get(
@@ -942,33 +992,45 @@ def run_claim_workflow(
             "analysis_result", {}
         )
 
+        # 8. Prepare persisted workflow results
         persisted_result = dict(validation_result)
+
         persisted_result["analysis_result"] = analysis_result
+        persisted_result["workflow_run_id"] = workflow_run_id
+        persisted_result["workflow_cycle"] = workflow_cycle
+        persisted_result["workflow_thread_id"] = thread_id
+        persisted_result["trigger"] = trigger
+        persisted_result["is_stale"] = False
 
         claim.validation_result = persisted_result
 
+        # 9. Handle human-review interrupt
         if interrupts:
 
             claim.status = "needs_review"
-
             db.commit()
 
-            logger.info(
-                "Workflow paused for human review: %s",
-                claim_id
-            )
+            interrupt_data = interrupts[0].value
 
             return {
                 "message": "Claim requires human review",
                 "claim_id": claim_id,
+                "workflow_run_id": workflow_run_id,
+                "workflow_cycle": workflow_cycle,
                 "thread_id": thread_id,
                 "workflow_paused": True,
                 "workflow_status": "needs_review",
-                "review_request": interrupts[0].value,
+                "review_request": {
+                    "message": interrupt_data.get("message"),
+                    "allowed_actions": interrupt_data.get(
+                        "allowed_actions", []
+                    )
+                },
                 "validation_result": validation_result,
                 "analysis_result": analysis_result
             }
 
+        # 10. Handle completed workflow
         claim.status = result.get("workflow_status")
 
         db.commit()
@@ -976,6 +1038,9 @@ def run_claim_workflow(
         return {
             "message": "Workflow completed",
             "claim_id": claim_id,
+            "workflow_run_id": workflow_run_id,
+            "workflow_cycle": workflow_cycle,
+            "thread_id": thread_id,
             "workflow_paused": False,
             "workflow_status": claim.status,
             "validation_result": validation_result,
@@ -999,18 +1064,20 @@ def run_claim_workflow(
             detail="Claim workflow execution failed"
         )
 
-@claim_router.post("/{claim_id}/resume-workflow")
-def resume_claim_workflow(
+
+@claim_router.post("/{claim_id}/run-workflow")
+def run_claim_workflow(
     claim_id: str,
-    payload: WorkflowReviewRequest,
     request: Request,
     db: Session = Depends(get_db)
 ):
-
     try:
-        claim = db.query(Claim).filter(
-            Claim.id == claim_id
-        ).first()
+        # 1. Fetch claim
+        claim = (
+            db.query(Claim)
+            .filter(Claim.id == claim_id)
+            .first()
+        )
 
         if not claim:
             raise HTTPException(
@@ -1018,70 +1085,146 @@ def resume_claim_workflow(
                 detail="Claim not found"
             )
 
-        if claim.status != "needs_review":
+        # 2. Aggregate latest document versions
+        aggregated_claim = ClaimAggregationService(
+            db
+        ).aggregate_claim_documents(claim_id)
+
+        # 3. Ensure documents are ready
+        if aggregated_claim.get("status") != "ready_for_validation":
             raise HTTPException(
-                status_code=400,
-                detail="Claim is not waiting for review"
+                status_code=409,
+                detail={
+                    "message": "Claim documents are not ready for validation",
+                    "aggregation_status": aggregated_claim.get("status"),
+                    "missing_documents": aggregated_claim.get(
+                        "missing_documents", []
+                    ),
+                    "pending_documents": aggregated_claim.get(
+                        "pending_documents", []
+                    ),
+                    "duplicate_documents": aggregated_claim.get(
+                        "duplicate_documents", []
+                    )
+                }
             )
 
-        thread_id = f"claim-{claim_id}"
+        # 4. Generate a new workflow cycle
+        previous_result = dict(claim.validation_result or {})
 
+        workflow_cycle = (
+            int(previous_result.get("workflow_cycle", 0)) + 1
+        )
+
+        workflow_run_id = str(uuid4())
+
+        thread_id = (
+            f"claim-{claim_id}-cycle-{workflow_cycle}-{workflow_run_id}"
+        )
+
+        trigger = (
+            "document_resubmission"
+            if previous_result.get("is_stale")
+            else "initial_submission"
+        )
+
+        logger.info(
+            "Starting workflow | claim=%s | cycle=%s | trigger=%s",
+            claim_id,
+            workflow_cycle,
+            trigger
+        )
+
+        # 5. Build orchestrator
         orchestrator = build_claim_workflow(request)
 
-        reviewer_input = {
-            "action": payload.action,
-            "reviewer": payload.reviewer,
-            "comments": payload.comments or ""
+        # 6. Prepare initial state
+        initial_state = {
+            "claim_id": claim_id,
+            "aggregated_claim": aggregated_claim,
+            "validation_result": {},
+            "analysis_result": {},
+            "workflow_status": "",
+            "next_action": "",
+            "analysis_recommendation": "",
+            "review_decision": "",
+            "reviewer": "",
+            "review_comments": "",
+            "workflow_run_id": workflow_run_id,
+            "workflow_cycle": workflow_cycle,
+            "trigger": trigger,
+            "error_message": ""
         }
 
-        # Resume paused LangGraph execution
-        result = orchestrator.resume(
-            thread_id,
-            reviewer_input
+        # 7. Execute fresh LangGraph workflow
+        result = orchestrator.execute(
+            initial_state,
+            thread_id
         )
 
-        # Save reviewer history
-        review = ClaimReview(
-            claim_id=claim_id,
-            action=payload.action,
-            reviewer=payload.reviewer,
-            comments=payload.comments
+        interrupts = result.get("__interrupt__", [])
+
+        validation_result = result.get(
+            "validation_result", {}
         )
 
-        db.add(review)
-
-        # Update claim
-        claim.status = result.get(
-            "workflow_status",
-            payload.action
+        analysis_result = result.get(
+            "analysis_result", {}
         )
 
-        persisted_result = dict(
-            claim.validation_result or {}
-        )
+        # 8. Prepare persisted workflow results
+        persisted_result = dict(validation_result)
 
-        persisted_result["review_decision"] = payload.action
-        persisted_result["reviewer"] = payload.reviewer
-        persisted_result["review_comments"] = payload.comments
+        persisted_result["analysis_result"] = analysis_result
+        persisted_result["workflow_run_id"] = workflow_run_id
+        persisted_result["workflow_cycle"] = workflow_cycle
+        persisted_result["workflow_thread_id"] = thread_id
+        persisted_result["trigger"] = trigger
+        persisted_result["is_stale"] = False
 
         claim.validation_result = persisted_result
 
-        db.commit()
-        db.refresh(claim)
+        # 9. Handle human-review interrupt
+        if interrupts:
 
-        logger.info(
-            "Claim workflow resumed successfully: %s | %s",
-            claim_id,
-            payload.action
-        )
+            claim.status = "needs_review"
+            db.commit()
+
+            interrupt_data = interrupts[0].value
+
+            return {
+                "message": "Claim requires human review",
+                "claim_id": claim_id,
+                "workflow_run_id": workflow_run_id,
+                "workflow_cycle": workflow_cycle,
+                "thread_id": thread_id,
+                "workflow_paused": True,
+                "workflow_status": "needs_review",
+                "review_request": {
+                    "message": interrupt_data.get("message"),
+                    "allowed_actions": interrupt_data.get(
+                        "allowed_actions", []
+                    )
+                },
+                "validation_result": validation_result,
+                "analysis_result": analysis_result
+            }
+
+        # 10. Handle completed workflow
+        claim.status = result.get("workflow_status")
+
+        db.commit()
 
         return {
-            "message": "Human review completed successfully",
+            "message": "Workflow completed",
             "claim_id": claim_id,
+            "workflow_run_id": workflow_run_id,
+            "workflow_cycle": workflow_cycle,
+            "thread_id": thread_id,
+            "workflow_paused": False,
             "workflow_status": claim.status,
-            "review_decision": payload.action,
-            "reviewer": payload.reviewer,
-            "review_comments": payload.comments
+            "validation_result": validation_result,
+            "analysis_result": analysis_result
         }
 
     except HTTPException:
@@ -1092,11 +1235,11 @@ def resume_claim_workflow(
         db.rollback()
 
         logger.exception(
-            "Failed to resume claim workflow: %s",
+            "Claim workflow failed: %s",
             claim_id
         )
 
         raise HTTPException(
             status_code=500,
-            detail="Failed to resume claim workflow"
+            detail="Claim workflow execution failed"
         )

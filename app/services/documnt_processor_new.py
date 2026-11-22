@@ -1,13 +1,16 @@
+
 import logging
 
 from app.core.database import SessionLocal
 from app.models.document import Document
+from app.models.claim import Claim
 
 from app.services.blob_storage import generate_read_sas_url
 from app.services.document_classifier import DocumentClassifier
 from app.services.document_extractor import DocumentExtractionService
 from app.services.extraction_normalizer import ExtractionNormalizer
 from app.core.field_metadata_merger import FieldMetadataMerger
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -28,20 +31,27 @@ async def process_document_task_new(document_id: str):
             logger.warning("Document not found: %s", document_id)
             return
 
-        # Step 2: Update status
+        # Step 2: Update processing status
         document.status = "processing"
         document.error_message = None
         db.commit()
 
-        logger.info("Starting document processing: %s", document_id)
+        logger.info(
+            "Starting document processing: %s",
+            document_id
+        )
 
         # Step 3: Generate Blob SAS URL
-        sas_url = generate_read_sas_url(document.blob_name)
+        sas_url = generate_read_sas_url(
+            document.blob_name
+        )
 
         # Step 4: Classify document
         classifier = DocumentClassifier()
 
-        classification = await classifier.classify_document(sas_url)
+        classification = await classifier.classify_document(
+            sas_url
+        )
 
         document_type = classification["document_type"]
 
@@ -60,17 +70,6 @@ async def process_document_task_new(document_id: str):
                 document_id
             )
             return
-
-        # Normalize known classifier category aliases
-        # category_aliases = {
-        #     "laboratory_report": "lab_report",
-        #     "insurance_claim_form": "claim_form",
-        # }
-
-        # document_type = category_aliases.get(
-        #     document_type,
-        #     document_type
-        # )
 
         # Step 6: Save classification
         document.document_type = document_type
@@ -91,7 +90,6 @@ async def process_document_task_new(document_id: str):
             sas_url=sas_url
         )
 
-
         # Step 8: Normalize extracted fields
         normalizer = ExtractionNormalizer()
 
@@ -111,7 +109,6 @@ async def process_document_task_new(document_id: str):
             field_metadata=structured_result.get("field_metadata", {})
         )
 
-        # Preserve document-level information
         enriched_result = {
             **structured_result,
             "fields": enriched_fields
@@ -122,28 +119,54 @@ async def process_document_task_new(document_id: str):
             document_id
         )
 
-        # Step 10: Save both results in PostgreSQL
-
-        # Original Azure response (unchanged)
+        # Step 10: Save extraction results
         document.analysis_result = extraction_result
-
-        # Enriched structured JSON
         document.structured_result = enriched_result
 
         document.status = "completed"
         document.error_message = None
 
-        # Mark corrected document version ready for review
+        # Step 11: Update resubmitted document review status
         if document.previous_document_id:
+
             document.review_status = "pending_review"
 
+            # Mark previous claim validation as stale
+            if document.claim_id:
+
+                claim = (
+                    db.query(Claim)
+                    .filter(Claim.id == document.claim_id)
+                    .first()
+                )
+
+                if claim and claim.validation_result:
+
+                    previous_result = dict(
+                        claim.validation_result
+                    )
+
+                    previous_result["is_stale"] = True
+
+                    previous_result["stale_reason"] = (
+                        "A corrected document version was processed"
+                    )
+
+                    previous_result["updated_document_id"] = (
+                        document.id
+                    )
+
+                    claim.validation_result = previous_result
+
+        # Step 12: Commit successful processing
         db.commit()
 
         logger.info(
-            "Document extraction, normalization and metadata merging completed: %s",
+            "Document extraction, normalization and metadata "
+            "merging completed successfully: %s",
             document_id
         )
-        
+
     except Exception as e:
 
         db.rollback()
@@ -153,16 +176,25 @@ async def process_document_task_new(document_id: str):
             document_id
         )
 
-        document = (
-            db.query(Document)
-            .filter(Document.id == document_id)
-            .first()
-        )
+        try:
+            document = (
+                db.query(Document)
+                .filter(Document.id == document_id)
+                .first()
+            )
 
-        if document:
-            document.status = "failed"
-            document.error_message = str(e)
-            db.commit()
+            if document:
+                document.status = "failed"
+                document.error_message = str(e)
+                db.commit()
+
+        except Exception:
+            db.rollback()
+
+            logger.exception(
+                "Failed to update document failure status: %s",
+                document_id
+            )
 
     finally:
         db.close()
